@@ -631,10 +631,18 @@ same session. When every model is limited it reads the reset time and waits,
 then resumes on the primary model.
 
 ${c.bold("Usage")}
-  claudekeeper run [prompt]        start a supervised task
-  claudekeeper resume <id|--last>  resume an existing session and keep it alive
-  claudekeeper list                show recent sessions to pick from
-  claudekeeper help                show this help
+  claudekeeper watch [-- claude args]  supervise a live interactive session
+  claudekeeper install-shell           wrap the claude command so every session is watched
+  claudekeeper run [prompt]            start a supervised unattended task
+  claudekeeper resume <id|--last>      resume an existing session and keep it alive
+  claudekeeper list                    show recent sessions to pick from
+  claudekeeper help                    show this help
+
+${c.bold("Transparent mode")}
+  Run  claudekeeper install-shell --write  once, then use claude exactly as
+  normal. Your live sessions look identical, but on a usage limit the supervisor
+  switches Fable to the latest Opus and continues, or waits for reset and
+  continues. Turn it off with  claudekeeper uninstall-shell.
 
 ${c.bold("Common options")}
   -m, --model <name>          primary model (default ${DEFAULTS.primaryModel})
@@ -690,6 +698,18 @@ async function main() {
     return cmdList(args);
   }
 
+  if (cmd === "watch") {
+    return cmdWatch(args);
+  }
+
+  if (cmd === "install-shell") {
+    return cmdInstallShell(args);
+  }
+
+  if (cmd === "uninstall-shell") {
+    return cmdUninstallShell(args);
+  }
+
   installSignalHandlers();
 
   if (cmd === "run") {
@@ -726,6 +746,133 @@ async function main() {
 
   fail(`unknown command "${cmd}". Try: claudekeeper help`);
   return 2;
+}
+
+// ---------------------------------------------------------------------------
+// watch: transparently supervise a live interactive claude session
+// ---------------------------------------------------------------------------
+
+function cmdWatch(args) {
+  const python = ENV.CLAUDEKEEPER_PYTHON || "python3";
+  const script = path.join(__dirname, "keeper-watch.py");
+  if (!fs.existsSync(script)) {
+    fail(`could not find the supervisor at ${script}`);
+    return Promise.resolve(1);
+  }
+  // Everything after -- is for claude; otherwise take the rest of the args.
+  const claudeArgs = (args.passthrough && args.passthrough.length)
+    ? args.passthrough
+    : args._.slice(1);
+
+  const env = Object.assign({}, process.env);
+  if (args.model) env.CLAUDEKEEPER_PRIMARY_MODEL = args.model;
+  if (args.fallback) env.CLAUDEKEEPER_FALLBACK_MODELS = args.fallback;
+  if (args["no-switch"] || args["no-fallback"]) env.CLAUDEKEEPER_SWITCH = "0";
+  if (args["no-wait"]) env.CLAUDEKEEPER_WAIT = "0";
+  if (args["no-force-model"]) env.CLAUDEKEEPER_FORCE_MODEL = "0";
+  if (args["dry-run"]) env.CLAUDEKEEPER_WATCH_DRYRUN = "1";
+  if (args["continue-prompt"]) env.CLAUDEKEEPER_CONTINUE_PROMPT = args["continue-prompt"];
+
+  return new Promise((resolve) => {
+    const child = spawn(python, [script, ...claudeArgs], { stdio: "inherit", env });
+    child.on("error", (err) => {
+      fail(`could not launch ${python}: ${err.message}. Is Python 3 installed?`);
+      resolve(1);
+    });
+    child.on("close", (code) => resolve(code == null ? 1 : code));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// install-shell: wrap the claude command so regular sessions are supervised
+// ---------------------------------------------------------------------------
+
+const SHELL_MARKER_START = "# >>> claudekeeper >>>";
+const SHELL_MARKER_END = "# <<< claudekeeper <<<";
+
+function shellBlock() {
+  return [
+    SHELL_MARKER_START,
+    "# Run the normal claude, kept alive across usage limits by claudekeeper.",
+    "# Remove this block or run: claudekeeper uninstall-shell",
+    'claude() { command claudekeeper watch -- "$@"; }',
+    SHELL_MARKER_END,
+    "",
+  ].join("\n");
+}
+
+function defaultRcFile() {
+  const shell = ENV.SHELL || "";
+  if (shell.includes("zsh")) return path.join(os.homedir(), ".zshrc");
+  if (shell.includes("bash")) return path.join(os.homedir(), ".bashrc");
+  return null;
+}
+
+function cmdInstallShell(args) {
+  const block = shellBlock();
+  const target = args.file || defaultRcFile();
+
+  if (!args.write) {
+    process.stdout.write(
+      `${c.bold("Add this to your shell profile to supervise every claude session:")}\n\n${block}\n`
+    );
+    if (target) {
+      process.stdout.write(c.dim(`Detected profile: ${target}\n`));
+      process.stdout.write(`Run ${c.bold("claudekeeper install-shell --write")} to add it there for you.\n`);
+    } else {
+      process.stdout.write(c.dim("Could not detect your shell profile. Add the block to the right file yourself.\n"));
+    }
+    return 0;
+  }
+
+  if (!target) {
+    fail("could not detect your shell profile. Pass --file <path> to choose one.");
+    return 2;
+  }
+
+  let existing = "";
+  try {
+    existing = fs.readFileSync(target, "utf8");
+  } catch {
+    existing = "";
+  }
+  if (existing.includes(SHELL_MARKER_START)) {
+    log(`already installed in ${target}. Nothing to do.`);
+    return 0;
+  }
+  const sep = existing && !existing.endsWith("\n") ? "\n" : "";
+  fs.appendFileSync(target, `${sep}\n${block}`);
+  log(c.green(`installed the claude wrapper in ${target}.`));
+  log(`open a new shell, or run ${c.bold(`source ${target}`)}, then use ${c.bold("claude")} as usual.`);
+  return 0;
+}
+
+function cmdUninstallShell(args) {
+  const target = args.file || defaultRcFile();
+  if (!target) {
+    fail("could not detect your shell profile. Pass --file <path>.");
+    return 2;
+  }
+  let existing;
+  try {
+    existing = fs.readFileSync(target, "utf8");
+  } catch {
+    log(`${target} not found. Nothing to remove.`);
+    return 0;
+  }
+  if (!existing.includes(SHELL_MARKER_START)) {
+    log(`no claudekeeper block found in ${target}.`);
+    return 0;
+  }
+  const re = new RegExp(`\\n?${escapeRe(SHELL_MARKER_START)}[\\s\\S]*?${escapeRe(SHELL_MARKER_END)}\\n?`, "g");
+  const next = existing.replace(re, "\n");
+  fs.writeFileSync(target, next);
+  log(c.green(`removed the claude wrapper from ${target}. Open a new shell to apply.`));
+  return 0;
+}
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function readPkg() {

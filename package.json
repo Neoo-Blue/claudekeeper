@@ -6,7 +6,7 @@
     "claudekeeper": "bin/claudekeeper.js"
   },
   "scripts": {
-    "test": "node test/run-tests.js && node test/integration.js"
+    "test": "node test/run-tests.js && node test/integration.js && python3 test/watch-tests.py"
   },
   "engines": {
     "node": ">=18"

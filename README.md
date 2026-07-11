@@ -26,7 +26,8 @@ the resume itself.
 
 - The `claude` CLI on your PATH (Claude Code).
 - Node 18 or newer.
-- No other dependencies.
+- Python 3 for transparent mode only (ships with macOS and most Linux).
+- No third party packages.
 
 ## Install
 
@@ -39,9 +40,43 @@ cd claudekeeper
 `install.sh` links `bin/claudekeeper.js` into `~/.local/bin/claudekeeper`. Make
 sure `~/.local/bin` is on your PATH.
 
+## Transparent mode (regular sessions)
+
+If you want your normal interactive sessions supervised without thinking about
+it, wrap the `claude` command once:
+
+```sh
+claudekeeper install-shell --write   # adds a claude() function to your shell profile
+```
+
+Open a new shell and keep using `claude` exactly as before. The session looks
+and feels identical, but a hidden supervisor watches it in the background. When
+a usage limit is reached it switches Fable to the latest Opus and sends a
+continue, or, when every model is limited, waits for the reset window and then
+continues. Turn it off any time:
+
+```sh
+claudekeeper uninstall-shell
+```
+
+Under the hood the wrapper runs `claudekeeper watch`, which launches the real
+`claude` inside a pseudo terminal and passes the terminal straight through. It
+needs Python 3, which ships with macOS and most Linux systems. A few notes:
+
+- The session starts on the primary model (Fable by default) so the chain is
+  predictable. Set `CLAUDEKEEPER_FORCE_MODEL=0` to keep your own default, or
+  pass your own `-m` when launching.
+- The mid session model switch drives the `/model` command in the session, so it
+  is best effort. The wait and continue is reliable.
+- Try it without any typing into your session first: `claudekeeper watch --dry-run`
+  logs what it would do instead of doing it.
+- Actions only fire when the session has gone quiet, so it does not fight you
+  while you are typing. Everything it does is logged to
+  `~/.claude/claudekeeper-watch.log`.
+
 ## Usage
 
-Start a supervised task:
+Start an unattended task:
 
 ```sh
 claudekeeper run "Refactor the billing module and run the tests"
