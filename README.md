@@ -4,14 +4,16 @@ Keep a Claude Code task alive across usage limits.
 
 Long autonomous runs stop the moment a usage limit is reached, and you have to
 come back, notice, and resume by hand. claudekeeper is a small supervisor that
-sits around Claude Code and does that for you. When a run stops because a usage
-limit was reached it does one of two things:
+sits around Claude Code and does that for you. It tells two kinds of limit apart
+and reacts to each correctly:
 
-1. **Switches models.** By default the chain is `fable` then `opus`. When the
-   Fable limit is reached, it switches to the latest Opus and resumes the same
-   session right away, so the work keeps moving.
-2. **Waits for reset.** When every model in the chain is limited, it reads the
-   reset time from Claude Code and waits, then resumes on the primary model.
+1. **Fable credit limit** (for example `You're out of usage credits`, `Fable 5
+   limit`). Only Fable is spent while the session still has room, so it switches
+   to the latest Opus and continues the same session right away.
+2. **Session limit** (for example `usage limit reached`, `weekly limit`, `5-hour
+   session limit`). The whole session is spent, so switching would not help. It
+   keeps the model you selected, waits for the session to refresh, then resumes
+   on that same model.
 
 Either way, the same session continues where it left off. You do not babysit it.
 
@@ -50,10 +52,10 @@ claudekeeper install-shell --write   # adds a claude() function to your shell pr
 ```
 
 Open a new shell and keep using `claude` exactly as before. The session looks
-and feels identical, but a hidden supervisor watches it in the background. When
-a usage limit is reached it switches Fable to the latest Opus and sends a
-continue, or, when every model is limited, waits for the reset window and then
-continues. Turn it off any time:
+and feels identical, but a hidden supervisor watches it in the background. On a
+Fable credit limit it switches to the latest Opus and continues. On an overall
+session limit it keeps your model, waits for the session to refresh, then
+continues on that same model. Turn it off any time:
 
 ```sh
 claudekeeper uninstall-shell

@@ -4,14 +4,21 @@ keeper-watch: transparent supervision of a live Claude Code session.
 
 It launches the real claude inside a pseudo terminal and forwards the terminal
 through unchanged, so the session looks and feels exactly like running claude
-directly. In the background it watches the session output for a usage limit.
-When one appears it switches to the next model in the chain (for example Fable
-to the latest Opus) by driving the /model command, confirms the switch, and
-sends a continue. When every model is limited it waits for the reset window and
-then continues.
+directly. In the background it watches the session output for a usage limit and
+tells two kinds apart:
+
+  Fable credit limit  (for example "You're out of usage credits", "Fable 5
+  limit") means only Fable is exhausted while the session still has room. Here
+  it switches to the fallback model (the latest Opus) with the /model command,
+  confirms the switch, and sends a continue.
+
+  Session limit  (for example "usage limit reached", "weekly limit", "5-hour
+  session limit") means the whole session is spent, so switching would not help.
+  Here it keeps the selected model, waits for the session to refresh, then
+  resumes on the selected model.
 
 The real terminal UI positions text with cursor moves instead of spaces, so the
-plain text scan can see words run together. The patterns below allow optional
+plain text scan can see words run together. The patterns allow optional
 whitespace between words for that reason.
 
 No third party dependencies: only the Python standard library.
@@ -30,7 +37,7 @@ import pty
 
 
 # ---------------------------------------------------------------------------
-# Configuration, read from the environment so the launcher can pass it through.
+# Configuration
 # ---------------------------------------------------------------------------
 
 def _flag(name, default):
@@ -68,15 +75,35 @@ LOG_PATH = os.environ.get(
     os.path.join(os.path.expanduser("~"), ".claude", "claudekeeper-watch.log"),
 )
 
-# The TUI can render words with no separating space, so allow optional space.
-DEFAULT_LIMIT_PATTERN = (
+
+# ---------------------------------------------------------------------------
+# Limit detection and classification
+#
+# Two families of banner, taken from the real Claude Code messages. A Fable
+# credit limit can be worked around by switching model; a session limit cannot.
+# ---------------------------------------------------------------------------
+
+FABLE_LIMIT_PATTERN = os.environ.get("CLAUDEKEEPER_FABLE_LIMIT_PATTERN", (
+    r"reached\s*your\s*fable(?:\s*5)?\s*limit"
+    r"|out\s*of\s*usage\s*credits"
+    r"|usage\s*credit\s*limit\s*reached"
+    r"|monthly\s*spend\s*limit"
+    r"|\bfable\s*5\s*limit\b"
+))
+
+SESSION_LIMIT_PATTERN = os.environ.get("CLAUDEKEEPER_SESSION_LIMIT_PATTERN", (
     r"usage\s*limit\s*reached"
-    r"|you\W{0,3}ve\s*hit\s*your\s.{0,40}limit"
-    r"|(?:5|five)\W?hour\s*limit\s*reached"
     r"|weekly\s*limit\s*reached"
-    r"|reached\s*your\s.{0,30}usage\s*limit"
-)
-LIMIT_RE = re.compile(os.environ.get("CLAUDEKEEPER_LIMIT_PATTERN", DEFAULT_LIMIT_PATTERN), re.I)
+    r"|(?:5|five)\W?hour\s*(?:session\s*)?limit\s*reached"
+    r"|reached\s*your\s*(?:weekly|usage|session)\s*limit"
+    r"|hit\s*your\s*(?:weekly|usage|session)[^.\n]{0,20}limit"
+    r"|session\s*limit\s*reached"
+))
+
+FABLE_LIMIT_RE = re.compile(FABLE_LIMIT_PATTERN, re.I)
+SESSION_LIMIT_RE = re.compile(SESSION_LIMIT_PATTERN, re.I)
+# Kept for compatibility and simple "is this any limit" checks.
+LIMIT_RE = re.compile("(?:%s)|(?:%s)" % (FABLE_LIMIT_PATTERN, SESSION_LIMIT_PATTERN), re.I)
 
 # The confirmation shown after /model, for example "Switch model? Yes, switch".
 DEFAULT_DIALOG_PATTERN = r"switch\s*model|yes,?\s*switch|switch\s*to\s*(?:opus|sonnet|fable|haiku)"
@@ -84,6 +111,15 @@ DIALOG_RE = re.compile(os.environ.get("CLAUDEKEEPER_DIALOG_PATTERN", DEFAULT_DIA
 
 # Strip terminal control sequences so the text scan sees words, not escapes.
 ANSI_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def classify_limit(text):
+    """Return 'fable', 'session', or None."""
+    if FABLE_LIMIT_RE.search(text):
+        return "fable"
+    if SESSION_LIMIT_RE.search(text):
+        return "session"
+    return None
 
 
 def dedupe_chain(models):
@@ -104,8 +140,30 @@ CHAIN = dedupe_chain([PRIMARY] + FALLBACKS)
 
 
 # ---------------------------------------------------------------------------
-# Reset time parsing. Mirrors the logic in the Node CLI.
+# Reset time parsing. Handles "resets in <duration>", "resets at <time>", a
+# numeric or ISO field, and the pipe format.
 # ---------------------------------------------------------------------------
+
+_DUR_RE = re.compile(r"(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", re.I)
+
+
+def parse_duration_seconds(s):
+    total = 0
+    found = False
+    for val, unit in _DUR_RE.findall(s):
+        found = True
+        v = int(val)
+        u = unit.lower()
+        if u.startswith("d"):
+            total += v * 86400
+        elif u.startswith("h"):
+            total += v * 3600
+        elif u.startswith("s"):
+            total += v
+        else:  # minutes
+            total += v * 60
+    return total if found else None
+
 
 def parse_reset_epoch(text, now=None):
     if now is None:
@@ -129,6 +187,14 @@ def parse_reset_epoch(text, now=None):
         except (ValueError, ImportError):
             pass
 
+    # "resets in 2h 30m", "resets in 45 minutes", "reset in 3 hours"
+    m = re.search(r"resets?\s+in\s+([^.\n]{1,40})", text, re.I)
+    if m:
+        secs = parse_duration_seconds(m.group(1))
+        if secs is not None:
+            return now + secs
+
+    # "resets at 3pm", "reset at 15:00"
     m = re.search(r"reset(?:s)?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text, re.I)
     if m:
         hour = int(m.group(1))
@@ -155,10 +221,7 @@ def _norm_epoch(digits):
     return n / 1000.0 if len(str(digits)) >= 13 else float(n)
 
 
-# ---------------------------------------------------------------------------
-# Decision for what to do when a limit is seen. Pure, so it is easy to test.
-# ---------------------------------------------------------------------------
-
+# Kept for the test suite and Node parity.
 def decide_on_limit(chain_index, chain_length, switch_enabled, wait_enabled):
     if switch_enabled and chain_index < chain_length - 1:
         return ("switch", chain_index + 1)
@@ -168,14 +231,7 @@ def decide_on_limit(chain_index, chain_length, switch_enabled, wait_enabled):
 
 
 # ---------------------------------------------------------------------------
-# Building the recovery step sequence.
-#
-# Each step is a dict with exactly one trigger and one payload to send:
-#   {"await_idle": secs, "send": b"..."}  send once output is quiet for secs
-#   {"delay": secs, "send": b"..."}       send secs after the step began
-#   {"await": regex, "timeout": secs, "send": b"..."}  send when regex matches
-#                                                        the fresh output, or on
-#                                                        timeout as a fallback
+# Recovery step sequences
 # ---------------------------------------------------------------------------
 
 def build_switch_sequence(model, continue_after=True):
@@ -214,23 +270,28 @@ def banner(msg):
     _log_file(msg)
 
 
+def _clock(epoch):
+    return time.strftime("%H:%M:%S", time.localtime(epoch))
+
+
 # ---------------------------------------------------------------------------
-# Supervisor: scans output and runs recovery sequences.
+# Supervisor
 # ---------------------------------------------------------------------------
 
 class Supervisor:
-    def __init__(self):
+    def __init__(self, selected_model, fallback_model):
+        self.selected_model = selected_model
+        self.fallback_model = fallback_model
+        self.current_model = selected_model
         self.buffer = ""
-        self.chain_index = 0
         self.last_output = time.time()
         self.last_user_input = 0.0
         self.cooldown_until = 0.0
-        self.pending = None          # None or ("wait", resume_at)
-        self.episode_output = 0
-        self.seq = None              # list of steps, or None
+        self.pending = None          # None, ("settle", t0), or ("wait", resume_at)
+        self.seq = None
         self.seq_i = 0
         self.step_start = 0.0
-        self.seq_target_index = 0
+        self.seq_target_model = None
         self.seq_label = ""
 
     def now(self):
@@ -243,58 +304,61 @@ class Supervisor:
         text = ANSI_RE.sub(b"", data).decode("utf-8", "replace")
         self.buffer = (self.buffer + text)[-8000:]
 
-        if self.seq is not None:
-            return
-
-        if self.pending is not None and self.pending[0] == "wait":
-            self.episode_output += len(text.strip())
-            if self.episode_output > 400:
-                banner("session activity resumed, cancelling the pending continue.")
-                self.pending = None
-                self.cooldown_until = self.now() + COOLDOWN_SECONDS
+        # While already handling a limit, keep buffering but do not re-detect.
+        if self.seq is not None or self.pending is not None:
             return
 
         if self.now() < self.cooldown_until:
             return
 
-        if LIMIT_RE.search(self.buffer):
-            self._begin_episode()
+        kind = classify_limit(self.buffer)
+        if kind is not None:
+            self._begin_episode(kind)
 
     def on_user_input(self, data):
         self.last_user_input = self.now()
+        # If the human comes back and types while we are waiting or about to act,
+        # stand down and let them drive.
+        if self.pending is not None and data:
+            banner("you are interacting with the session, standing down until the next limit.")
+            self.pending = None
+            self.cooldown_until = self.now() + max(COOLDOWN_SECONDS, 90)
 
-    # -- episode start ------------------------------------------------------
+    # -- deciding what to do ------------------------------------------------
 
-    def _begin_episode(self):
-        self.episode_output = 0
-        action, nxt = decide_on_limit(self.chain_index, len(CHAIN), SWITCH_ENABLED, WAIT_ENABLED)
-        if action == "switch":
-            target = CHAIN[nxt]
-            banner("%s usage limit reached. Switching to %s and continuing."
-                   % (CHAIN[self.chain_index], target))
-            self._start_sequence(build_switch_sequence(target), nxt, "switch to %s" % target)
-        elif action == "wait":
-            reset = parse_reset_epoch(self.buffer)
-            cap = self.now() + WAIT_CAP_MINUTES * 60
-            if reset and reset > self.now():
-                resume_at = min(reset + RESET_BUFFER_SECONDS, cap)
-                banner("every model is limited. Waiting until %s to resume."
-                       % time.strftime("%H:%M:%S", time.localtime(resume_at)))
-            else:
-                resume_at = min(self.now() + RETRY_MINUTES * 60, cap)
-                banner("limit reached but no reset time was visible. Will retry at %s."
-                       % time.strftime("%H:%M:%S", time.localtime(resume_at)))
-            self.pending = ("wait", resume_at)
-        else:
-            banner("limit reached but switching and waiting are both disabled. Not acting.")
+    def _can_switch_to_fallback(self):
+        return (
+            SWITCH_ENABLED
+            and self.fallback_model
+            and self.current_model.lower() == self.selected_model.lower()
+            and self.fallback_model.lower() != self.current_model.lower()
+        )
+
+    def _begin_episode(self, kind):
+        if kind == "fable" and self._can_switch_to_fallback():
+            banner("Fable limit reached. Switching to %s to keep working within this session."
+                   % self.fallback_model)
+            self._start_sequence(build_switch_sequence(self.fallback_model),
+                                 self.fallback_model, "switch to %s" % self.fallback_model)
+            return
+
+        if not WAIT_ENABLED:
+            banner("limit reached and waiting is disabled. Not acting.")
             self.cooldown_until = self.now() + COOLDOWN_SECONDS
+            return
 
-    def _start_sequence(self, steps, target_index, label):
-        self.buffer = ""          # scan only output produced from here on
+        # Do not switch models. Keep the selected model and let the banner finish
+        # rendering before reading the reset time, then wait for the refresh.
+        label = "session limit" if kind == "session" else "limit"
+        banner("%s reached. Keeping %s and reading the reset time." % (label, self.selected_model))
+        self.pending = ("settle", self.now())
+
+    def _start_sequence(self, steps, target_model, label):
+        self.buffer = ""
         self.seq = steps
         self.seq_i = 0
         self.step_start = self.now()
-        self.seq_target_index = target_index
+        self.seq_target_model = target_model
         self.seq_label = label
         _log_file("recovery start: %s" % label)
 
@@ -309,15 +373,39 @@ class Supervisor:
             self._run_step(write)
             return
 
-        if self.pending is not None and self.pending[0] == "wait":
+        if self.pending is None:
+            return
+
+        kind = self.pending[0]
+        if kind == "settle":
+            t0 = self.pending[1]
+            # Wait for the banner to finish printing, then read the reset time.
+            if self._idle(IDLE_SECONDS) or (self.now() - t0) > 12:
+                reset = parse_reset_epoch(self.buffer)
+                cap = self.now() + WAIT_CAP_MINUTES * 60
+                if reset and reset > self.now():
+                    resume_at = min(reset + RESET_BUFFER_SECONDS, cap)
+                    when = _clock(resume_at)
+                else:
+                    resume_at = min(self.now() + RETRY_MINUTES * 60, cap)
+                    when = _clock(resume_at) + " (no reset time seen)"
+                banner("waiting until %s for the session to refresh, then resuming on %s."
+                       % (when, self.selected_model))
+                self.buffer = ""   # do not re-match this same banner later
+                self.pending = ("wait", resume_at)
+
+        elif kind == "wait":
             resume_at = self.pending[1]
             if self.now() >= resume_at and self._idle(IDLE_SECONDS):
-                banner("reset window passed. Resuming on %s." % CHAIN[0])
+                banner("session refreshed. Resuming on %s." % self.selected_model)
                 self.pending = None
-                if len(CHAIN) > 1:
-                    self._start_sequence(build_switch_sequence(CHAIN[0]), 0, "resume on %s" % CHAIN[0])
+                if self.current_model.lower() != self.selected_model.lower() and SWITCH_ENABLED:
+                    # We had switched to the fallback earlier; return to the selected model.
+                    self._start_sequence(build_switch_sequence(self.selected_model),
+                                         self.selected_model, "resume on %s" % self.selected_model)
                 else:
-                    self._start_sequence(build_continue_sequence(), 0, "resume")
+                    self._start_sequence(build_continue_sequence(),
+                                         self.current_model, "resume")
 
     def _run_step(self, write):
         step = self.seq[self.seq_i]
@@ -332,7 +420,7 @@ class Supervisor:
             if step["await"].search(self.buffer):
                 ready = True
             elif (t - self.step_start) >= step.get("timeout", 5.0):
-                ready = True   # fallback: send anyway, a stray Enter is harmless
+                ready = True   # fallback: a stray Enter on an empty composer is harmless
 
         if not ready:
             return
@@ -349,15 +437,16 @@ class Supervisor:
         self.seq_i += 1
         self.step_start = self.now()
         if self.seq_i >= len(self.seq):
-            self.chain_index = self.seq_target_index
+            if self.seq_target_model:
+                self.current_model = self.seq_target_model
             self.seq = None
             self.cooldown_until = self.now() + COOLDOWN_SECONDS
             banner("recovery complete (%s). Now on %s.%s"
-                   % (self.seq_label, CHAIN[self.chain_index], " (dry run)" if DRYRUN else ""))
+                   % (self.seq_label, self.current_model, " (dry run)" if DRYRUN else ""))
 
 
 # ---------------------------------------------------------------------------
-# The pseudo terminal driver.
+# The pseudo terminal driver
 # ---------------------------------------------------------------------------
 
 def _set_winsize(master_fd):
@@ -368,16 +457,29 @@ def _set_winsize(master_fd):
         pass
 
 
-def build_child_args(argv):
+def _extract_user_model(argv):
+    for i, a in enumerate(argv):
+        if a in ("--model", "-m") and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--model="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def build_child_args(argv, selected_model):
     args = list(argv)
-    has_model = any(a in ("--model", "-m") or a.startswith("--model=") for a in args)
-    if FORCE_MODEL and not has_model and CHAIN:
-        args = ["--model", CHAIN[0]] + args
+    has_model = _extract_user_model(argv) is not None
+    if FORCE_MODEL and not has_model and selected_model:
+        args = ["--model", selected_model] + args
     return args
 
 
 def main(argv):
-    child_args = build_child_args(argv)
+    user_model = _extract_user_model(argv)
+    selected_model = user_model or (CHAIN[0] if CHAIN else PRIMARY)
+    fallback_model = next((m for m in FALLBACKS if m.lower() != selected_model.lower()), None)
+
+    child_args = build_child_args(argv, selected_model)
 
     stdin_is_tty = sys.stdin.isatty()
     old_attrs = None
@@ -390,8 +492,9 @@ def main(argv):
             sys.stderr.write("keeper: could not launch %s: %s\n" % (CLAUDE_BIN, exc))
             os._exit(127)
 
-    banner("supervising claude. chain: %s. switch=%s wait=%s%s"
-           % (" then ".join(CHAIN), SWITCH_ENABLED, WAIT_ENABLED, " dryrun" if DRYRUN else ""))
+    banner("supervising claude. selected=%s, fallback=%s, switch=%s wait=%s%s"
+           % (selected_model, fallback_model or "none", SWITCH_ENABLED, WAIT_ENABLED,
+              " dryrun" if DRYRUN else ""))
 
     if stdin_is_tty:
         try:
@@ -403,7 +506,7 @@ def main(argv):
     _set_winsize(master_fd)
     signal.signal(signal.SIGWINCH, lambda *_: _set_winsize(master_fd))
 
-    sup = Supervisor()
+    sup = Supervisor(selected_model, fallback_model)
 
     def write_master(payload):
         try:

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 A stand in for the interactive claude, used only by the pty integration test.
-It prints a usage limit, then models the real terminal flow: a /model command
-brings up a switch confirmation that must be accepted before the switch takes,
-and only then does a continue message resume the work. It records everything the
-supervisor types so the test can assert the full recovery. No quota is involved.
+It emits one of the two real limit banners and models the matching flow, then
+records everything the supervisor types so the test can assert the recovery.
+No quota is involved.
+
+FAKE_SCENARIO=fable    print a Fable credit limit; expect a /model switch that
+                       must be confirmed, then a continue.
+FAKE_SCENARIO=session  print a session usage limit with a short reset; expect
+                       only a continue after the wait, and no /model switch.
 """
 
 import os
@@ -12,6 +16,7 @@ import sys
 import time
 
 log_path = os.environ.get("FAKE_LOG", "/dev/null")
+scenario = os.environ.get("FAKE_SCENARIO", "fable")
 
 
 def logline(s):
@@ -22,7 +27,11 @@ def logline(s):
 
 print("working on the task", flush=True)
 time.sleep(0.2)
-print("Claude usage limit reached. Your limit will reset at 3pm.", flush=True)
+
+if scenario == "session":
+    print("You've reached your usage limit. Resets in 2 seconds.", flush=True)
+else:
+    print("You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.", flush=True)
 
 expecting_confirm = False
 while True:

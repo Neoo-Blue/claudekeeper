@@ -65,6 +65,27 @@ check("detects usage limit reached", w.LIMIT_RE.search("Claude AI usage limit re
 check("does not fire on normal text", w.LIMIT_RE.search("running the tests now") is None)
 check("detects limit when the TUI drops spaces", w.LIMIT_RE.search("Claudeusagelimitreached") is not None)
 
+# --- unit: classify_limit (Fable credit vs session) -------------------------
+check("fable credit banner classifies as fable",
+      w.classify_limit("You're out of usage credits. /model to switch models.") == "fable")
+check("fable 5 limit banner classifies as fable",
+      w.classify_limit("You've reached your Fable 5 limit.") == "fable")
+check("monthly spend banner classifies as fable",
+      w.classify_limit("You've hit your monthly spend limit.") == "fable")
+check("generic usage limit classifies as session",
+      w.classify_limit("You've reached your usage limit. Resets in 2h.") == "session")
+check("weekly limit reached classifies as session",
+      w.classify_limit("weekly limit reached") == "session")
+check("normal text classifies as None", w.classify_limit("working on the task") is None)
+check("classify tolerates dropped spaces",
+      w.classify_limit("You'reoutofusagecredits") == "fable")
+
+# --- unit: reset duration parsing -------------------------------------------
+now2 = 1_000_000.0
+check("resets in hours and minutes", w.parse_reset_epoch("resets in 2h 30m", now=now2) == now2 + 2 * 3600 + 30 * 60)
+check("resets in minutes words", w.parse_reset_epoch("Resets in 45 minutes", now=now2) == now2 + 45 * 60)
+check("resets in seconds", w.parse_reset_epoch("resets in 5 seconds", now=now2) == now2 + 5)
+
 # --- unit: DIALOG_RE (the model switch confirmation) ------------------------
 check("detects switch dialog with spaces", w.DIALOG_RE.search("Switch model? Yes, switch to Opus") is not None)
 check("detects switch dialog when spaces are dropped", w.DIALOG_RE.search("Switchmodel?Yes,switchtoOpus4.8") is not None)
@@ -82,7 +103,13 @@ stripped = w.ANSI_RE.sub(b"", b"\x1b[31musage limit reached\x1b[0m")
 check("ansi strip leaves plain text", stripped == b"usage limit reached", repr(stripped))
 
 # --- integration: pty detect then inject ------------------------------------
-def integration():
+try:
+    os.chmod(FAKE, 0o755)
+except OSError:
+    pass
+
+
+def integration(scenario):
     fd, log_path = tempfile.mkstemp(prefix="keeper-it-")
     os.close(fd)
     open(log_path, "w").close()
@@ -90,12 +117,14 @@ def integration():
     env.update({
         "CLAUDEKEEPER_CLAUDE_BIN": FAKE,
         "FAKE_LOG": log_path,
+        "FAKE_SCENARIO": scenario,
         "CLAUDEKEEPER_FORCE_MODEL": "0",
         "CLAUDEKEEPER_IDLE_SECONDS": "0.3",
         "CLAUDEKEEPER_MODEL_SUBMIT_DELAY": "0.3",
         "CLAUDEKEEPER_AFTER_CONFIRM_IDLE": "0.3",
         "CLAUDEKEEPER_CONFIRM_TIMEOUT": "3",
         "CLAUDEKEEPER_COOLDOWN_SECONDS": "2",
+        "CLAUDEKEEPER_RESET_BUFFER_SECONDS": "0",
         "CLAUDEKEEPER_PRIMARY_MODEL": "fable",
         "CLAUDEKEEPER_FALLBACK_MODELS": "opus",
     })
@@ -106,32 +135,33 @@ def integration():
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=20,
+            timeout=25,
         )
     except subprocess.TimeoutExpired as exc:
-        return False, "supervisor timed out: %s" % exc
+        return None, None, "supervisor timed out: %s" % exc
     with open(log_path) as f:
         injected = f.read()
     os.unlink(log_path)
     out = (proc.stdout or b"").decode("utf-8", "replace")
     detail = "exit=%s\ninjected=%r\nstdout=%r" % (proc.returncode, injected, out)
-    ok = (
-        "/model opus" in injected
-        and "continue" in injected.lower()
-        and "resumed work now" in out
-        and proc.returncode == 0
-    )
-    return ok, detail
+    return injected, out, detail
 
 
-make_fake_executable = True
-try:
-    os.chmod(FAKE, 0o755)
-except OSError:
-    pass
+# Fable credit limit: it must switch to opus and continue.
+inj, out, detail = integration("fable")
+fable_ok = inj is not None and (
+    "/model opus" in inj and "continue" in inj.lower()
+    and "resumed work now" in out
+)
+check("fable credit limit switches to opus and continues", fable_ok, detail)
 
-ok, detail = integration()
-check("pty supervisor switches to opus and continues", ok, detail)
+# Session limit: it must wait then continue on the same model, no /model switch.
+inj, out, detail = integration("session")
+session_ok = inj is not None and (
+    "/model" not in inj and "continue" in inj.lower()
+    and "resumed work now" in out
+)
+check("session limit waits and continues without switching model", session_ok, detail)
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

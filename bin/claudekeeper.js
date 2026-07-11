@@ -110,7 +110,7 @@ function sleep(ms) {
 //   unknown  the run died in a way we do not recognise
 // ---------------------------------------------------------------------------
 
-const LIMIT_RE = /usage limit reached|resource[_ ]exhausted|billing_error/i;
+const LIMIT_RE = /usage limit reached|usage credit limit|out of usage credits|reached your (?:fable|usage|weekly|session)[^.\n]{0,12}limit|fable 5 limit|weekly limit reached|monthly spend limit|resource[_ ]exhausted|billing_error/i;
 const FATAL_RE = /credit balance (?:is )?too low|invalid api key|please run \/login|authentication failed|oauth token (?:expired|revoked)|401 unauthorized|403 forbidden|bad credentials/i;
 
 function classifyOutcome({ combined, code, resultText, isError }) {
