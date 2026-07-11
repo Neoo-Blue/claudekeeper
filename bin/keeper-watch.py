@@ -5,9 +5,14 @@ keeper-watch: transparent supervision of a live Claude Code session.
 It launches the real claude inside a pseudo terminal and forwards the terminal
 through unchanged, so the session looks and feels exactly like running claude
 directly. In the background it watches the session output for a usage limit.
-When one appears it either switches to the next model in the chain (for example
-Fable to the latest Opus) with the /model command and sends a continue, or, when
-every model is limited, waits for the reset window and then sends a continue.
+When one appears it switches to the next model in the chain (for example Fable
+to the latest Opus) by driving the /model command, confirms the switch, and
+sends a continue. When every model is limited it waits for the reset window and
+then continues.
+
+The real terminal UI positions text with cursor moves instead of spaces, so the
+plain text scan can see words run together. The patterns below allow optional
+whitespace between words for that reason.
 
 No third party dependencies: only the Python standard library.
 """
@@ -18,7 +23,6 @@ import re
 import time
 import signal
 import select
-import struct
 import fcntl
 import termios
 import tty
@@ -51,6 +55,9 @@ FORCE_MODEL = _flag("CLAUDEKEEPER_FORCE_MODEL", True)
 DRYRUN = _flag("CLAUDEKEEPER_WATCH_DRYRUN", False)
 CONTINUE_MSG = os.environ.get("CLAUDEKEEPER_CONTINUE_PROMPT", "Continue exactly where you left off.")
 IDLE_SECONDS = _num("CLAUDEKEEPER_IDLE_SECONDS", 2.5)
+CONFIRM_TIMEOUT = _num("CLAUDEKEEPER_CONFIRM_TIMEOUT", 5.0)
+MODEL_SUBMIT_DELAY = _num("CLAUDEKEEPER_MODEL_SUBMIT_DELAY", 0.7)
+AFTER_CONFIRM_IDLE = _num("CLAUDEKEEPER_AFTER_CONFIRM_IDLE", 1.2)
 RETRY_MINUTES = _num("CLAUDEKEEPER_RETRY_MINUTES", 20)
 RESET_BUFFER_SECONDS = _num("CLAUDEKEEPER_RESET_BUFFER_SECONDS", 20)
 COOLDOWN_SECONDS = _num("CLAUDEKEEPER_COOLDOWN_SECONDS", 25)
@@ -61,16 +68,21 @@ LOG_PATH = os.environ.get(
     os.path.join(os.path.expanduser("~"), ".claude", "claudekeeper-watch.log"),
 )
 
+# The TUI can render words with no separating space, so allow optional space.
 DEFAULT_LIMIT_PATTERN = (
-    r"usage limit reached"
-    r"|you(?:'|’)?ve hit your .{0,40}limit"
-    r"|(?:5|five)[ -]hour limit reached"
-    r"|weekly limit reached"
-    r"|reached your .{0,30}usage limit"
+    r"usage\s*limit\s*reached"
+    r"|you\W{0,3}ve\s*hit\s*your\s.{0,40}limit"
+    r"|(?:5|five)\W?hour\s*limit\s*reached"
+    r"|weekly\s*limit\s*reached"
+    r"|reached\s*your\s.{0,30}usage\s*limit"
 )
 LIMIT_RE = re.compile(os.environ.get("CLAUDEKEEPER_LIMIT_PATTERN", DEFAULT_LIMIT_PATTERN), re.I)
 
-# Strip terminal control sequences so the text scan sees plain words.
+# The confirmation shown after /model, for example "Switch model? Yes, switch".
+DEFAULT_DIALOG_PATTERN = r"switch\s*model|yes,?\s*switch|switch\s*to\s*(?:opus|sonnet|fable|haiku)"
+DIALOG_RE = re.compile(os.environ.get("CLAUDEKEEPER_DIALOG_PATTERN", DEFAULT_DIALOG_PATTERN), re.I)
+
+# Strip terminal control sequences so the text scan sees words, not escapes.
 ANSI_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
@@ -144,7 +156,7 @@ def _norm_epoch(digits):
 
 
 # ---------------------------------------------------------------------------
-# The decision for what to do when a limit is seen. Pure, so it is easy to test.
+# Decision for what to do when a limit is seen. Pure, so it is easy to test.
 # ---------------------------------------------------------------------------
 
 def decide_on_limit(chain_index, chain_length, switch_enabled, wait_enabled):
@@ -153,6 +165,32 @@ def decide_on_limit(chain_index, chain_length, switch_enabled, wait_enabled):
     if wait_enabled:
         return ("wait", 0)
     return ("stop", chain_index)
+
+
+# ---------------------------------------------------------------------------
+# Building the recovery step sequence.
+#
+# Each step is a dict with exactly one trigger and one payload to send:
+#   {"await_idle": secs, "send": b"..."}  send once output is quiet for secs
+#   {"delay": secs, "send": b"..."}       send secs after the step began
+#   {"await": regex, "timeout": secs, "send": b"..."}  send when regex matches
+#                                                        the fresh output, or on
+#                                                        timeout as a fallback
+# ---------------------------------------------------------------------------
+
+def build_switch_sequence(model, continue_after=True):
+    steps = [
+        {"await_idle": IDLE_SECONDS, "send": ("/model %s" % model).encode()},
+        {"delay": MODEL_SUBMIT_DELAY, "send": b"\r"},
+        {"await": DIALOG_RE, "timeout": CONFIRM_TIMEOUT, "send": b"\r"},
+    ]
+    if continue_after:
+        steps.append({"await_idle": AFTER_CONFIRM_IDLE, "send": (CONTINUE_MSG + "\r").encode()})
+    return steps
+
+
+def build_continue_sequence():
+    return [{"await_idle": IDLE_SECONDS, "send": (CONTINUE_MSG + "\r").encode()}]
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +215,7 @@ def banner(msg):
 
 
 # ---------------------------------------------------------------------------
-# Supervisor state: scans output and schedules recovery actions.
+# Supervisor: scans output and runs recovery sequences.
 # ---------------------------------------------------------------------------
 
 class Supervisor:
@@ -187,25 +225,30 @@ class Supervisor:
         self.last_output = time.time()
         self.last_user_input = 0.0
         self.cooldown_until = 0.0
-        # pending is None, ("switch",), or ("wait", resume_at)
-        self.pending = None
-        self.episode_output = 0  # bytes of output seen since a limit was detected
-        # queue of (send_at, bytes) injections
-        self.queue = []
+        self.pending = None          # None or ("wait", resume_at)
+        self.episode_output = 0
+        self.seq = None              # list of steps, or None
+        self.seq_i = 0
+        self.step_start = 0.0
+        self.seq_target_index = 0
+        self.seq_label = ""
 
     def now(self):
         return time.time()
+
+    # -- output handling ----------------------------------------------------
 
     def on_output(self, data):
         self.last_output = self.now()
         text = ANSI_RE.sub(b"", data).decode("utf-8", "replace")
         self.buffer = (self.buffer + text)[-8000:]
 
-        if self.pending is not None:
-            # If the session clearly resumed on its own, drop what we planned.
+        if self.seq is not None:
+            return
+
+        if self.pending is not None and self.pending[0] == "wait":
             self.episode_output += len(text.strip())
-            if self.episode_output > 400 and self.pending[0] == "wait":
-                # Substantial new activity during a wait means someone continued.
+            if self.episode_output > 400:
                 banner("session activity resumed, cancelling the pending continue.")
                 self.pending = None
                 self.cooldown_until = self.now() + COOLDOWN_SECONDS
@@ -220,14 +263,16 @@ class Supervisor:
     def on_user_input(self, data):
         self.last_user_input = self.now()
 
+    # -- episode start ------------------------------------------------------
+
     def _begin_episode(self):
         self.episode_output = 0
         action, nxt = decide_on_limit(self.chain_index, len(CHAIN), SWITCH_ENABLED, WAIT_ENABLED)
         if action == "switch":
             target = CHAIN[nxt]
-            banner("%s usage limit reached. Will switch to %s and continue once the session is idle."
+            banner("%s usage limit reached. Switching to %s and continuing."
                    % (CHAIN[self.chain_index], target))
-            self.pending = ("switch",)
+            self._start_sequence(build_switch_sequence(target), nxt, "switch to %s" % target)
         elif action == "wait":
             reset = parse_reset_epoch(self.buffer)
             cap = self.now() + WAIT_CAP_MINUTES * 60
@@ -244,54 +289,71 @@ class Supervisor:
             banner("limit reached but switching and waiting are both disabled. Not acting.")
             self.cooldown_until = self.now() + COOLDOWN_SECONDS
 
-    def _idle(self):
-        t = self.now()
-        return (t - self.last_output) >= IDLE_SECONDS and (t - self.last_user_input) >= IDLE_SECONDS
+    def _start_sequence(self, steps, target_index, label):
+        self.buffer = ""          # scan only output produced from here on
+        self.seq = steps
+        self.seq_i = 0
+        self.step_start = self.now()
+        self.seq_target_index = target_index
+        self.seq_label = label
+        _log_file("recovery start: %s" % label)
 
-    def _enqueue_recovery(self, model_cmd, note):
+    # -- driving the loop ---------------------------------------------------
+
+    def _idle(self, secs):
         t = self.now()
-        if model_cmd:
-            self.queue.append((t + 0.1, ("/model %s\r" % model_cmd).encode()))
-            self.queue.append((t + 1.3, (CONTINUE_MSG + "\r").encode()))
-        else:
-            self.queue.append((t + 0.1, (CONTINUE_MSG + "\r").encode()))
-        _log_file("enqueued recovery: %s" % note)
+        return (t - self.last_output) >= secs and (t - self.last_user_input) >= secs
 
     def tick(self, write):
-        t = self.now()
-
-        # Flush any due injections.
-        if self.queue:
-            still = []
-            for send_at, payload in self.queue:
-                if t >= send_at:
-                    if not DRYRUN:
-                        write(payload)
-                else:
-                    still.append((send_at, payload))
-            self.queue = still
-
-        if self.pending is None:
+        if self.seq is not None:
+            self._run_step(write)
             return
 
-        kind = self.pending[0]
-        if kind == "switch":
-            if self._idle():
-                target = CHAIN[self.chain_index + 1]
-                banner("switching to %s and continuing.%s" % (target, " (dry run)" if DRYRUN else ""))
-                self._enqueue_recovery(target, "switch to %s" % target)
-                self.chain_index += 1
-                self.cooldown_until = t + COOLDOWN_SECONDS
-                self.pending = None
-        elif kind == "wait":
+        if self.pending is not None and self.pending[0] == "wait":
             resume_at = self.pending[1]
-            if t >= resume_at and self._idle():
-                banner("reset window passed. Resuming on %s.%s" % (CHAIN[0], " (dry run)" if DRYRUN else ""))
-                model_cmd = CHAIN[0] if len(CHAIN) > 1 else None
-                self._enqueue_recovery(model_cmd, "wait then resume on %s" % CHAIN[0])
-                self.chain_index = 0
-                self.cooldown_until = t + COOLDOWN_SECONDS
+            if self.now() >= resume_at and self._idle(IDLE_SECONDS):
+                banner("reset window passed. Resuming on %s." % CHAIN[0])
                 self.pending = None
+                if len(CHAIN) > 1:
+                    self._start_sequence(build_switch_sequence(CHAIN[0]), 0, "resume on %s" % CHAIN[0])
+                else:
+                    self._start_sequence(build_continue_sequence(), 0, "resume")
+
+    def _run_step(self, write):
+        step = self.seq[self.seq_i]
+        t = self.now()
+        ready = False
+
+        if "await_idle" in step:
+            ready = self._idle(step["await_idle"])
+        elif "delay" in step:
+            ready = (t - self.step_start) >= step["delay"]
+        elif "await" in step:
+            if step["await"].search(self.buffer):
+                ready = True
+            elif (t - self.step_start) >= step.get("timeout", 5.0):
+                ready = True   # fallback: send anyway, a stray Enter is harmless
+
+        if not ready:
+            return
+
+        payload = step.get("send")
+        if payload:
+            if DRYRUN:
+                _log_file("would send: %r" % payload)
+            else:
+                write(payload)
+        self._advance()
+
+    def _advance(self):
+        self.seq_i += 1
+        self.step_start = self.now()
+        if self.seq_i >= len(self.seq):
+            self.chain_index = self.seq_target_index
+            self.seq = None
+            self.cooldown_until = self.now() + COOLDOWN_SECONDS
+            banner("recovery complete (%s). Now on %s.%s"
+                   % (self.seq_label, CHAIN[self.chain_index], " (dry run)" if DRYRUN else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +384,6 @@ def main(argv):
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        # Child: become the real claude.
         try:
             os.execvp(CLAUDE_BIN, [CLAUDE_BIN] + child_args)
         except OSError as exc:

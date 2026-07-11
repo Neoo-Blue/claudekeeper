@@ -1,6 +1,6 @@
 {
   "name": "claudekeeper",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keep a Claude Code task alive across usage limits: switch Fable to the latest Opus, wait out resets, and auto resume the same session.",
   "bin": {
     "claudekeeper": "bin/claudekeeper.js"

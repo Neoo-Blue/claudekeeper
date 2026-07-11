@@ -63,6 +63,19 @@ check("no reset returns None", w.parse_reset_epoch("usage limit reached, sorry")
 # --- unit: LIMIT_RE ---------------------------------------------------------
 check("detects usage limit reached", w.LIMIT_RE.search("Claude AI usage limit reached") is not None)
 check("does not fire on normal text", w.LIMIT_RE.search("running the tests now") is None)
+check("detects limit when the TUI drops spaces", w.LIMIT_RE.search("Claudeusagelimitreached") is not None)
+
+# --- unit: DIALOG_RE (the model switch confirmation) ------------------------
+check("detects switch dialog with spaces", w.DIALOG_RE.search("Switch model? Yes, switch to Opus") is not None)
+check("detects switch dialog when spaces are dropped", w.DIALOG_RE.search("Switchmodel?Yes,switchtoOpus4.8") is not None)
+check("dialog does not fire on normal text", w.DIALOG_RE.search("working on the task") is None)
+
+# --- unit: sequence builder -------------------------------------------------
+seq = w.build_switch_sequence("opus", continue_after=True)
+check("switch sequence types the model command", seq[0]["send"] == b"/model opus")
+check("switch sequence submits then confirms then continues", len(seq) == 4)
+check("switch confirm step waits on the dialog", "await" in seq[2] and seq[2]["send"] == b"\r")
+check("continue sequence is a single step", len(w.build_continue_sequence()) == 1)
 
 # --- unit: ANSI stripping ---------------------------------------------------
 stripped = w.ANSI_RE.sub(b"", b"\x1b[31musage limit reached\x1b[0m")
@@ -79,6 +92,9 @@ def integration():
         "FAKE_LOG": log_path,
         "CLAUDEKEEPER_FORCE_MODEL": "0",
         "CLAUDEKEEPER_IDLE_SECONDS": "0.3",
+        "CLAUDEKEEPER_MODEL_SUBMIT_DELAY": "0.3",
+        "CLAUDEKEEPER_AFTER_CONFIRM_IDLE": "0.3",
+        "CLAUDEKEEPER_CONFIRM_TIMEOUT": "3",
         "CLAUDEKEEPER_COOLDOWN_SECONDS": "2",
         "CLAUDEKEEPER_PRIMARY_MODEL": "fable",
         "CLAUDEKEEPER_FALLBACK_MODELS": "opus",
