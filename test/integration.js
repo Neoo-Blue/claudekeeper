@@ -126,5 +126,14 @@ test("opus primary dedupes and waits, no wasted switch", () => {
   assert.match(out, /done/i, out);
 });
 
+// 6) The selftest command runs the whole live recovery end to end (no quota).
+test("selftest drives switch and continue and exits clean", () => {
+  const r = run(["selftest"], { CLAUDEKEEPER_IDLE_SECONDS: "0.3", CLAUDEKEEPER_COOLDOWN_SECONDS: "2" });
+  const out = r.stdout + r.stderr;
+  assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}\n${out}`);
+  assert.match(out, /\/model opus/, out);
+  assert.match(out, /self test passed/i, out);
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

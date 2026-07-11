@@ -632,6 +632,7 @@ then resumes on the primary model.
 
 ${c.bold("Usage")}
   claudekeeper watch [-- claude args]  supervise a live interactive session
+  claudekeeper selftest                watch the recovery happen live, no quota used
   claudekeeper install-shell           wrap the claude command so every session is watched
   claudekeeper run [prompt]            start a supervised unattended task
   claudekeeper resume <id|--last>      resume an existing session and keep it alive
@@ -700,6 +701,10 @@ async function main() {
 
   if (cmd === "watch") {
     return cmdWatch(args);
+  }
+
+  if (cmd === "selftest") {
+    return cmdSelftest(args);
   }
 
   if (cmd === "install-shell") {
@@ -780,6 +785,40 @@ function cmdWatch(args) {
       resolve(1);
     });
     child.on("close", (code) => resolve(code == null ? 1 : code));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// selftest: watch the whole recovery happen live against a simulated session
+// ---------------------------------------------------------------------------
+
+function cmdSelftest(args) {
+  const python = ENV.CLAUDEKEEPER_PYTHON || "python3";
+  const script = path.join(__dirname, "keeper-watch.py");
+  const demo = path.join(__dirname, "keeper-selftest.py");
+  if (!fs.existsSync(script) || !fs.existsSync(demo)) {
+    fail("could not find the supervisor scripts.");
+    return Promise.resolve(1);
+  }
+  log("running a live self test. No quota is used. Watch for the switch and continue below.\n");
+  const env = Object.assign({}, process.env, {
+    CLAUDEKEEPER_CLAUDE_BIN: demo,
+    CLAUDEKEEPER_FORCE_MODEL: "0",
+    CLAUDEKEEPER_IDLE_SECONDS: args["idle-seconds"] || "0.6",
+    CLAUDEKEEPER_COOLDOWN_SECONDS: "3",
+    CLAUDEKEEPER_PRIMARY_MODEL: args.model || "fable",
+    CLAUDEKEEPER_FALLBACK_MODELS: args.fallback || "opus",
+  });
+  return new Promise((resolve) => {
+    const child = spawn(python, [script], { stdio: "inherit", env });
+    child.on("error", (err) => {
+      fail(`could not launch ${python}: ${err.message}. Is Python 3 installed?`);
+      resolve(1);
+    });
+    child.on("close", (code) => {
+      if (code === 0) log(c.green("\nself test passed. The transparent wrapper is working."));
+      resolve(code == null ? 1 : code);
+    });
   });
 }
 
