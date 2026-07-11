@@ -31,7 +31,7 @@ the resume itself.
 ## Install
 
 ```sh
-git clone https://github.com/OWNER/claudekeeper.git
+git clone https://github.com/Neoo-Blue/claudekeeper.git
 cd claudekeeper
 ./install.sh
 ```
