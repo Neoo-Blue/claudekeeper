@@ -207,6 +207,22 @@ function normaliseEpoch(digits) {
 //   wait    every model is limited, so sleep until reset then restart the chain
 // ---------------------------------------------------------------------------
 
+// Collapse an ordered list of models to distinct entries, keeping the first of
+// each. This avoids a wasted resume when, say, the primary is opus and the
+// default fallback is also opus.
+function dedupeChain(models) {
+  const seen = new Set();
+  const out = [];
+  for (const m of models) {
+    if (!m) continue;
+    const key = String(m).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(m);
+  }
+  return out;
+}
+
 function decideOnLimit({ modelIndex, chainLength, switchEnabled, waitEnabled }) {
   if (switchEnabled && modelIndex < chainLength - 1) {
     return { action: "switch", nextIndex: modelIndex + 1 };
@@ -372,7 +388,7 @@ async function waitForReset(resetEpochMs, opts) {
 // ---------------------------------------------------------------------------
 
 async function supervise(opts) {
-  const chain = [opts.primaryModel, ...opts.fallbackModels];
+  const chain = dedupeChain([opts.primaryModel, ...opts.fallbackModels]);
   let modelIndex = 0;
   let sessionId = opts.sessionId || null;
   let prompt = opts.prompt;
@@ -743,6 +759,7 @@ module.exports = {
   parseResetEpochMs,
   normaliseEpoch,
   decideOnLimit,
+  dedupeChain,
   parseArgs,
   buildOpts,
   formatDuration,

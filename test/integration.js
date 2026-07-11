@@ -106,5 +106,25 @@ test("no switch waits instead of switching", () => {
   assert.match(out, /Waiting|waiting/, out);
 });
 
+// 5) Primary opus with the default opus fallback: the chain dedupes, so a limit
+//    waits for reset rather than wasting a switch to the same model.
+test("opus primary dedupes and waits, no wasted switch", () => {
+  const dir = tmpStateDir();
+  const r = run(
+    ["run", "do the thing", "--model", "opus", "--quiet"],
+    {
+      FAKE_MODE: "limit_once",
+      FAKE_RESET_OFFSET_S: "1",
+      FAKE_STATE_DIR: dir,
+      CLAUDEKEEPER_RESET_BUFFER_SECONDS: "0",
+    }
+  );
+  const out = r.stdout + r.stderr;
+  assert.strictEqual(r.status, 0, `expected exit 0, got ${r.status}\n${out}`);
+  assert.doesNotMatch(out, /Switching to/i, out);
+  assert.match(out, /Waiting|waiting/, out);
+  assert.match(out, /done/i, out);
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

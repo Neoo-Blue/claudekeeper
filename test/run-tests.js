@@ -143,6 +143,20 @@ test("no switch and no wait stops", () => {
   assert.strictEqual(d.action, "stop");
 });
 
+// --- dedupeChain -----------------------------------------------------------
+
+test("dedupeChain collapses duplicate opus primary and fallback", () => {
+  assert.deepStrictEqual(k.dedupeChain(["opus", "opus"]), ["opus"]);
+});
+
+test("dedupeChain keeps a distinct chain in order", () => {
+  assert.deepStrictEqual(k.dedupeChain(["sonnet", "opus"]), ["sonnet", "opus"]);
+});
+
+test("dedupeChain is case insensitive and drops empties", () => {
+  assert.deepStrictEqual(k.dedupeChain(["fable", "", "Fable", "opus"]), ["fable", "opus"]);
+});
+
 // --- parseArgs and buildOpts ----------------------------------------------
 
 test("parseArgs collects passthrough after double dash", () => {
