@@ -75,6 +75,17 @@ LOG_PATH = os.environ.get(
     os.path.join(os.path.expanduser("~"), ".claude", "claudekeeper-watch.log"),
 )
 
+# Subcommands that parse their own arguments. "claude --model fable rc" leaves
+# the bare model name in the subcommand's argv and it exits with
+# "Unknown argument: fable", so the model is never forced in front of one.
+# Names from past and present Claude Code releases, so an upgrade cannot
+# reintroduce the crash.
+SUBCOMMANDS = frozenset(os.environ.get("CLAUDEKEEPER_SUBCOMMANDS", (
+    "agents auth auto-mode config doctor gateway import install mcp "
+    "migrate-installer plugin plugins project rc remote-control serve "
+    "setup-token ultrareview update upgrade"
+)).split())
+
 
 # ---------------------------------------------------------------------------
 # Limit detection and classification
@@ -466,10 +477,24 @@ def _extract_user_model(argv):
     return None
 
 
+def first_command_token(argv):
+    """The first bare token, which is where the CLI looks for a subcommand."""
+    for a in argv:
+        if a == "--":
+            break
+        if not a.startswith("-"):
+            return a
+    return None
+
+
+def is_subcommand(argv):
+    return first_command_token(argv) in SUBCOMMANDS
+
+
 def build_child_args(argv, selected_model):
     args = list(argv)
     has_model = _extract_user_model(argv) is not None
-    if FORCE_MODEL and not has_model and selected_model:
+    if FORCE_MODEL and not has_model and selected_model and not is_subcommand(argv):
         args = ["--model", selected_model] + args
     return args
 
@@ -492,9 +517,13 @@ def main(argv):
             sys.stderr.write("keeper: could not launch %s: %s\n" % (CLAUDE_BIN, exc))
             os._exit(127)
 
-    banner("supervising claude. selected=%s, fallback=%s, switch=%s wait=%s%s"
-           % (selected_model, fallback_model or "none", SWITCH_ENABLED, WAIT_ENABLED,
-              " dryrun" if DRYRUN else ""))
+    if is_subcommand(argv):
+        banner("running claude %s. model left alone, no supervision needed."
+               % first_command_token(argv))
+    else:
+        banner("supervising claude. selected=%s, fallback=%s, switch=%s wait=%s%s"
+               % (selected_model, fallback_model or "none", SWITCH_ENABLED, WAIT_ENABLED,
+                  " dryrun" if DRYRUN else ""))
 
     if stdin_is_tty:
         try:

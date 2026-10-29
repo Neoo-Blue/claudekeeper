@@ -68,6 +68,9 @@ needs Python 3, which ships with macOS and most Linux systems. A few notes:
 - The session starts on the primary model (Fable by default) so the chain is
   predictable. Set `CLAUDEKEEPER_FORCE_MODEL=0` to keep your own default, or
   pass your own `-m` when launching.
+- Subcommands such as `claude remote-control`, `claude mcp` or `claude update`
+  run untouched: they parse their own flags, so no model is forced in front of
+  them. Override the list with `CLAUDEKEEPER_SUBCOMMANDS` if a new one appears.
 - The mid session model switch drives the `/model` command in the session, so it
   is best effort. The wait and continue is reliable.
 - Try it without any typing into your session first: `claudekeeper watch --dry-run`

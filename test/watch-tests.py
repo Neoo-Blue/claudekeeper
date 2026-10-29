@@ -98,6 +98,27 @@ check("switch sequence submits then confirms then continues", len(seq) == 4)
 check("switch confirm step waits on the dialog", "await" in seq[2] and seq[2]["send"] == b"\r")
 check("continue sequence is a single step", len(w.build_continue_sequence()) == 1)
 
+# --- unit: child argument building ------------------------------------------
+check("forces the selected model on a plain session",
+      w.build_child_args([], "fable") == ["--model", "fable"])
+check("forces the model ahead of a prompt",
+      w.build_child_args(["-p", "ship it"], "fable") == ["--model", "fable", "-p", "ship it"])
+check("keeps the model the user asked for",
+      w.build_child_args(["--model", "opus"], "fable") == ["--model", "opus"])
+check("leaves remote-control alone",
+      w.build_child_args(["remote-control"], "fable") == ["remote-control"],
+      repr(w.build_child_args(["remote-control"], "fable")))
+check("leaves the rc alias alone",
+      w.build_child_args(["rc", "--name", "mac"], "fable") == ["rc", "--name", "mac"])
+check("leaves mcp alone", w.build_child_args(["mcp", "list"], "fable") == ["mcp", "list"])
+check("a subcommand behind a global flag is still a subcommand",
+      w.build_child_args(["--verbose", "update"], "fable") == ["--verbose", "update"])
+check("a prompt that merely mentions a subcommand still gets the model",
+      w.build_child_args(["update the readme"], "fable")
+      == ["--model", "fable", "update the readme"])
+check("first bare token is the command", w.first_command_token(["-v", "mcp", "list"]) == "mcp")
+check("no bare token means no command", w.first_command_token(["-v"]) is None)
+
 # --- unit: ANSI stripping ---------------------------------------------------
 stripped = w.ANSI_RE.sub(b"", b"\x1b[31musage limit reached\x1b[0m")
 check("ansi strip leaves plain text", stripped == b"usage limit reached", repr(stripped))
